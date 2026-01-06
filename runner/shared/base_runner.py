@@ -1,0 +1,160 @@
+import os
+import numpy as np
+import torch
+from global_mappo_1.utils.shared_buffer import SharedReplayBuffer
+
+
+def _t2n(x):
+    return x.detach().cpu().numpy()
+
+
+class Runner(object):
+    def __init__(self, config):
+
+        self.all_args = config['all_args']
+        self.envs = config['envs']
+        self.eval_envs = config['eval_envs']
+        self.device = config['device']
+        self.num_agents = config['num_agents']
+        if config.__contains__("render_envs"):
+            self.render_envs = config['render_envs']
+
+        self.env_name = self.all_args.env_name
+        self.algorithm_name = self.all_args.algorithm_name
+        self.experiment_name = self.all_args.experiment_name
+        self.use_centralized_V = self.all_args.use_centralized_V
+        self.use_obs_instead_of_state = self.all_args.use_obs_instead_of_state
+        self.num_env_steps = self.all_args.num_env_steps
+        self.episode_length = self.all_args.episode_length
+        self.n_rollout_threads = self.all_args.n_rollout_threads
+        self.n_eval_rollout_threads = self.all_args.n_eval_rollout_threads
+        self.n_render_rollout_threads = self.all_args.n_render_rollout_threads
+        self.use_linear_lr_decay = self.all_args.use_linear_lr_decay
+        self.hidden_size = self.all_args.hidden_size
+        self.use_render = self.all_args.use_render
+        self.recurrent_N = self.all_args.recurrent_N
+
+        self.save_interval = self.all_args.save_interval
+        self.use_eval = self.all_args.use_eval
+        self.eval_interval = self.all_args.eval_interval
+        self.log_interval = self.all_args.log_interval
+
+        self.model_dir = self.all_args.model_dir
+
+        self.run_dir = config["run_dir"]
+        self.log_dir = str(self.run_dir / 'logs')
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+        self.save_dir = str(self.run_dir / 'models')
+        if not os.path.exists(self.save_dir):
+            os.makedirs(self.save_dir)
+
+        from global_mappo_1.algorithms.algorithm.r_mappo import RMAPPO as TrainAlgo
+        from global_mappo_1.algorithms.algorithm.rMAPPOPolicy import RMAPPOPolicy as Policy
+        from global_mappo_1.algorithms.algorithm.r_mappo_exploit import RMAPPO_exploit as TrainAlgo_exploit
+        from global_mappo_1.algorithms.algorithm.rMAPPOPolicy_exploit import RMAPPOPolicy_exploit as Policy_exploit
+
+        share_observation_space = self.envs.share_observation_space[0] if self.use_centralized_V else \
+        self.envs.observation_space[0]
+
+        self.policy = Policy(self.all_args,
+                             self.envs.observation_space[0],
+                             share_observation_space,
+                             self.envs.envs[0].env.action_dim,
+                             device=self.device)
+        self.policy_exploit = Policy_exploit(self.all_args,
+                                             self.envs.observation_space[0],
+                                             share_observation_space,
+                                             self.envs.envs[0].env.action_dim,
+                                             device=self.device)
+
+        if self.model_dir is not None:
+            self.restore()
+
+        self.trainer = TrainAlgo(self.all_args, self.policy, device=self.device)
+        self.trainer_exploit = TrainAlgo_exploit(self.all_args, self.policy_exploit, device=self.device)
+
+        self.buffer = SharedReplayBuffer(self.all_args,
+                                         self.num_agents,
+                                         self.envs.observation_space[0],
+                                         share_observation_space,
+                                         self.envs.envs[0].env.action_dim)
+
+    def run(self):
+        raise NotImplementedError
+
+    def warmup(self):
+        raise NotImplementedError
+
+    def collect(self, step):
+        raise NotImplementedError
+
+    def insert(self, data):
+        raise NotImplementedError
+
+    @torch.no_grad()
+    def compute(self):
+        self.trainer.prep_rollout()
+        next_values = self.trainer.policy.get_values(np.concatenate(self.buffer.share_obs[-1]),np.concatenate(self.buffer.actions[-1]),
+                                                     np.concatenate(self.buffer.rnn_states_critic[-1]),
+                                                     np.concatenate(self.buffer.masks[-1]))
+        next_values = np.array(np.split(_t2n(next_values), self.n_rollout_threads))
+        self.buffer.compute_returns(next_values, self.trainer.value_normalizer)
+
+    def compute_exploit(self):
+        self.trainer_exploit.prep_rollout()
+        next_values = self.trainer_exploit.policy.get_values(np.concatenate(self.buffer.share_obs[-1]),
+                                                             np.concatenate(self.buffer.rnn_states_critic[-1]),
+                                                             np.concatenate(self.buffer.masks[-1]))
+        next_values = np.array(np.split(_t2n(next_values), self.n_rollout_threads))
+        self.buffer.compute_returns(next_values, self.trainer_exploit.value_normalizer)
+
+    def train_1(self, vary_L, vary_noise):
+        self.trainer.prep_training()
+        train_infos = self.trainer.train_1(self.buffer, vary_L, vary_noise)
+        self.buffer.after_update()
+        return train_infos
+
+    def train_2(self, vary_L, vary_noise):
+        self.trainer.prep_training()
+        train_infos = self.trainer.train_2(self.buffer, vary_L, vary_noise)
+        self.buffer.after_update()
+        return train_infos
+
+    def train_exploit(self, vary_L, vary_noise):
+        self.trainer_exploit.prep_training()
+        train_infos_exploit = self.trainer_exploit.train(self.buffer, vary_L, vary_noise)
+        self.buffer.after_update()
+        return train_infos_exploit
+
+    def save(self):
+        policy_actor = self.trainer.policy.actor
+        torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor.pt")
+        policy_critic = self.trainer.policy.critic
+        torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic.pt")
+
+    def save_exploit(self):
+        policy_actor_exploit = self.trainer_exploit.policy.actor
+        torch.save(policy_actor_exploit.state_dict(), str(self.save_dir) + "/actor.pt")
+        policy_critic_exploit = self.trainer_exploit.policy.critic
+        torch.save(policy_critic_exploit.state_dict(), str(self.save_dir) + "/critic.pt")
+
+    def restore(self):
+        policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor.pt')
+        self.policy.actor.load_state_dict(policy_actor_state_dict)
+        if not self.all_args.use_render:
+            policy_critic_state_dict = torch.load(str(self.model_dir) + '/critic.pt')
+            self.policy.critic.load_state_dict(policy_critic_state_dict)
+
+    def restore_exploit(self):
+        policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor.pt')
+        self.policy.actor.load_state_dict(policy_actor_state_dict)
+        if not self.all_args.use_render:
+            policy_critic_state_dict = torch.load(str(self.model_dir) + '/critic.pt')
+            self.policy_exploit.critic.load_state_dict(policy_critic_state_dict)
+
+    def log_train(self, train_infos, total_num_steps):
+        pass
+
+    def log_env(self, env_infos, total_num_steps):
+        pass
