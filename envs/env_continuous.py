@@ -1,5 +1,5 @@
 import numpy as np
-from global_mappo_1.envs.env_core import EnvCore
+from global_mappo.envs.env_core import EnvCore
 
 
 class ContinuousActionEnv(object):

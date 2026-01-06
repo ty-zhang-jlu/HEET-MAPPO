@@ -22,22 +22,13 @@ class ACTLayer(nn.Module):
         action_dim = action_space
         self.action_out = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
         self.action_out_BS = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
+        self.action_out_MBS = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
         self.action_out_joint = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
 
     def forward(self, x, available_actions=None, deterministic=False, noise_scale=0.01):
-        """
-        Compute actions and action logprobs from given input.
-        :param x: (torch.Tensor) input to network.
-        :param available_actions: (torch.Tensor) denotes which actions are available to agent
-                                  (if None, all actions available)
-        :param deterministic: (bool) whether to sample from action distribution or return the mode.
-
-        :return actions: (torch.Tensor) actions to take.
-        :return action_log_probs: (torch.Tensor) log probabilities of taken actions.
-        """
         action_logit = self.action_out(x)
         actions = action_logit.mode() if deterministic else action_logit.sample()
-        # actions = torch.tanh(actions)  # 将动作限制在 [-1, 1] 范围内
+        actions = torch.tanh(actions)  # 将动作限制在 [-1, 1] 范围内
         action_log_probs = action_logit.log_probs(actions)
 
         return actions, action_log_probs
@@ -121,6 +112,30 @@ class ACTLayer(nn.Module):
                                        allow_unused=True)
 
         return action_log_probs, entropy.mean(), grad_ent_2
+
+    def evaluate_actions_MBS(self, x, action, available_actions=None, active_masks=None):
+
+        action_log_probs = []
+        dist_entropy = []
+        # for action_out, act in zip(self.action_outs, action):
+        action_logit = self.action_out_MBS(x)
+        action_log_probs.append(action_logit.log_probs(action))
+        entropy = action_logit.entropy()
+        if active_masks is not None:
+            if len(action_logit.entropy().shape) == len(active_masks.shape):
+                dist_entropy.append((action_logit.entropy() * active_masks).sum() / active_masks.sum())
+            else:
+                dist_entropy.append(
+                    (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
+        else:
+            dist_entropy.append(action_logit.entropy().mean())
+
+        action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+        dist_entropy = dist_entropy[0]  # / 2.0 + dist_entropy[1] / 0.98  # ! dosen't make sense
+        grad_ent_3 = torch.autograd.grad(entropy.mean(), [action_logit.loc, action_logit.scale], retain_graph=True,
+                                       allow_unused=True)
+
+        return action_log_probs, entropy.mean(), grad_ent_3
 
     def evaluate_actions_joint(self, x, action, available_actions=None, active_masks=None):
         action_log_probs = []

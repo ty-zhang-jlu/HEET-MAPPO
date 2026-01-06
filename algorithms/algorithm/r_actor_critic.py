@@ -1,16 +1,30 @@
+"""
+# @Time    : 2021/7/1 6:53 下午
+# @Author  : hezhiqiang01
+# @Email   : hezhiqiang01@baidu.com
+# @File    : r_actor_critic.py
+"""
+
 import torch
 import torch.nn as nn
-from global_mappo_1.algorithms.utils.util import init, check
-from global_mappo_1.algorithms.utils.cnn import CNNBase
-from global_mappo_1.algorithms.utils.mlp import MLPBase
-from global_mappo_1.algorithms.utils.rnn import RNNLayer
-from global_mappo_1.algorithms.utils.act import ACTLayer
-from global_mappo_1.algorithms.utils.popart import PopArt
-from global_mappo_1.utils.util import get_shape_from_obs_space
+from global_mappo.algorithms.utils.util import init, check
+from global_mappo.algorithms.utils.cnn import CNNBase
+from global_mappo.algorithms.utils.mlp import MLPBase
+from global_mappo.algorithms.utils.rnn import RNNLayer
+from global_mappo.algorithms.utils.act import ACTLayer
+from global_mappo.algorithms.utils.popart import PopArt
+from global_mappo.utils.util import get_shape_from_obs_space
 import numpy as np
 
 
 class R_Actor(nn.Module):
+    """
+    Actor network class for MAPPO. Outputs actions given observations.
+    :param args: (argparse.Namespace) arguments containing relevant model information.
+    :param obs_space: (gym.Space) observation space.
+    :param action_space: (gym.Space) action space.
+    :param device: (torch.device) specifies the device to run on (cpu/gpu).
+    """
     def __init__(self, args, obs_space, action_space, device=torch.device("cpu")):
         super(R_Actor, self).__init__()
         self.hidden_size = args.hidden_size
@@ -26,6 +40,7 @@ class R_Actor(nn.Module):
         obs_shape = get_shape_from_obs_space(obs_space)
         base = CNNBase if len(obs_shape) == 3 else MLPBase
         self.base = base(args, obs_shape[0])
+        # base = MLPBase
         self.base = base(args, obs_shape[0])
 
         if self._use_naive_recurrent_policy or self._use_recurrent_policy:
@@ -36,6 +51,19 @@ class R_Actor(nn.Module):
         self.to(device)
 
     def forward(self, obs, rnn_states, masks, available_actions=None, deterministic=False):
+        """
+        Compute actions from the given inputs.
+        :param obs: (np.ndarray / torch.Tensor) observation inputs into network.
+        :param rnn_states: (np.ndarray / torch.Tensor) if RNN network, hidden states for RNN.
+        :param masks: (np.ndarray / torch.Tensor) mask tensor denoting if hidden states should be reinitialized to zeros.
+        :param available_actions: (np.ndarray / torch.Tensor) denotes which actions are available to agent
+                                                              (if None, all actions available)
+        :param deterministic: (bool) whether to sample from action distribution or return the mode.
+
+        :return actions: (torch.Tensor) actions to take.
+        :return action_log_probs: (torch.Tensor) log probabilities of taken actions.
+        :return rnn_states: (torch.Tensor) updated RNN hidden states.
+        """
         obs = check(obs).to(**self.tpdv)
         rnn_states = check(rnn_states).to(**self.tpdv)
         masks = check(masks).to(**self.tpdv)
@@ -52,6 +80,19 @@ class R_Actor(nn.Module):
         return actions, action_log_probs, rnn_states
 
     def evaluate_actions(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
+        """
+        Compute log probability and entropy of given actions.
+        :param obs: (torch.Tensor) observation inputs into network.
+        :param action: (torch.Tensor) actions whose entropy and log probability to evaluate.
+        :param rnn_states: (torch.Tensor) if RNN network, hidden states for RNN.
+        :param masks: (torch.Tensor) mask tensor denoting if hidden states should be reinitialized to zeros.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+                                                              (if None, all actions available)
+        :param active_masks: (torch.Tensor) denotes whether an agent is active or dead.
+
+        :return action_log_probs: (torch.Tensor) log probabilities of the input actions.
+        :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
+        """
         obs = check(obs).to(**self.tpdv)
         rnn_states = check(rnn_states).to(**self.tpdv)
         action = check(action).to(**self.tpdv)
@@ -99,6 +140,30 @@ class R_Actor(nn.Module):
 
         return action_log_probs, dist_entropy, grad_2
 
+    def evaluate_actions_MBS(self, obs, rnn_states_MBS, action_MBS, masks, available_actions=None, active_masks=None):
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states_MBS).to(**self.tpdv)
+        action_MBS = check(action_MBS).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        if active_masks is not None:
+            active_masks = check(active_masks).to(**self.tpdv)
+
+        actor_features = self.base(obs)
+
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+
+        action_log_probs, dist_entropy, grad_3 = self.act.evaluate_actions_MBS(actor_features,
+                                                                   action_MBS, available_actions,
+                                                                   active_masks=
+                                                                   active_masks if self._use_policy_active_masks
+                                                                   else None)
+
+        return action_log_probs, dist_entropy, grad_3
+
     def evaluate_actions_joint(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
         obs = check(obs).to(**self.tpdv)
         rnn_states = check(rnn_states).to(**self.tpdv)
@@ -125,6 +190,13 @@ class R_Actor(nn.Module):
 
 
 class R_Critic(nn.Module):
+    """
+    Critic network class for MAPPO. Outputs value function predictions given centralized input (MAPPO) or
+                            local observations (IPPO).
+    :param args: (argparse.Namespace) arguments containing relevant model information.
+    :param cent_obs_space: (gym.Space) (centralized) observation space.
+    :param device: (torch.device) specifies the device to run on (cpu/gpu).
+    """
     def __init__(self, args, cent_obs_space, action_space, device=torch.device("cpu")):
         super(R_Critic, self).__init__()
         self.hidden_size = args.hidden_size
@@ -136,9 +208,10 @@ class R_Critic(nn.Module):
         self.tpdv = dict(dtype=torch.float32, device=device)
         init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][self._use_orthogonal]
 
+        # 参数噪声配置
         self.use_param_noise = args._use_param_noise
         self.param_noise_std = args._param_noise_std
-        self.perturbed_weights = {}
+        self.perturbed_weights = {}  # 存储扰动后的参数
 
         cent_obs_shape = get_shape_from_obs_space(cent_obs_space)
         base = CNNBase if len(cent_obs_shape) == 3 else MLPBase
@@ -163,6 +236,16 @@ class R_Critic(nn.Module):
         self.to(device)
 
     def forward(self, cent_obs, actions, rnn_states, masks):
+        """
+        Compute actions from the given inputs.
+        :param cent_obs: (np.ndarray / torch.Tensor) observation inputs into network.
+        :param rnn_states: (np.ndarray / torch.Tensor) if RNN network, hidden states for RNN.
+        :param masks: (np.ndarray / torch.Tensor) mask tensor denoting if RNN states should be reinitialized to zeros.
+
+        :return values: (torch.Tensor) value function predictions.
+        :return rnn_states: (torch.Tensor) updated RNN hidden states.
+        """
+        # 使用扰动参数（如果启用）
         if self.use_param_noise:
             for name, param in self.named_parameters():
                 if name in self.perturbed_weights:
@@ -173,9 +256,9 @@ class R_Critic(nn.Module):
         masks = check(masks).to(**self.tpdv)
 
         if isinstance(actions, np.ndarray):
-            actions = torch.from_numpy(actions).to(device='cuda:0')
+            actions = torch.from_numpy(actions).to(device='cuda:0')  # 转换为 CUDA 张量
         if isinstance(cent_obs, np.ndarray):
-            cent_obs = torch.from_numpy(cent_obs).to(device='cuda:0')
+            cent_obs = torch.from_numpy(cent_obs).to(device='cuda:0')  # 转换为 CUDA 张量
 
         critic_features = self.base(cent_obs)
 
@@ -185,7 +268,9 @@ class R_Critic(nn.Module):
             critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)
             action_features, rnn_states_q = self.rnn(action_features, rnn_states, masks)
         values = self.v_out(critic_features)
+        # 新增Q值计算
         q_values = self.q_out(action_features)
+        # values = torch.mean(q_values, dim=0)
 
         return values, q_values, rnn_states
 
@@ -198,5 +283,5 @@ class DynamicCoeffNetwork(nn.Module):
 
     def forward(self, x):
         x = self.activation(self.fc1(x))
-        x = torch.sigmoid(self.fc2(x))
+        x = torch.sigmoid(self.fc2(x))  # 输出范围在[0, 1]
         return x

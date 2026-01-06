@@ -1,11 +1,21 @@
+"""
+# @Time    : 2021/7/1 7:15 下午
+# @Author  : hezhiqiang01
+# @Email   : hezhiqiang01@baidu.com
+# @File    : env_runner.py
+"""
+
 import time
 import numpy as np
 import torch
-from global_mappo_1.runner.shared.base_runner import Runner
-from global_mappo_1.algorithms.algorithm.OPT_DDPG import Agent_J
+from global_mappo.runner.shared.base_runner import Runner
+# from global_mappo.algorithms.algorithm.OPT_DDPG import Agent_J
+from global_mappo.algorithms.algorithm.TD3 import TD3
 from scipy.io import savemat
 import csv
-import os
+
+
+# import imageio
 
 
 def _t2n(x):
@@ -13,33 +23,41 @@ def _t2n(x):
 
 
 class EnvRunner(Runner):
+    """Runner class to perform training, evaluation. and data collection for the MPEs. See parent class for details."""
+
     def __init__(self, config):
         super(EnvRunner, self).__init__(config)
         self.M = 4
-        self.J = 5
+        self.J = 3
         self.N = 16
         self.K = 5
+        self.num_bs = 2  # 基站数量
+        self.B = 3 * self.num_bs  #总带宽资源
         self.n_input_j = 1
         self.n_output_j = 2 * self.J * self.K
-        self.alpha = 0.0001
-        self.beta = 0.001
+        self.alpha = 0.00001
+        self.beta = 0.0001
         self.tau = 0.005
-        self.n_agents = self.N + 1
+        self.n_agents = (self.N + 1) * self.num_bs
         self.whether_exploit = False
 
     def run(self):
-        agent_j = Agent_J(self.alpha, self.beta, self.n_input_j, self.tau, self.n_output_j, gamma=0.99, max_size=10000,
-                          C_fc1_dims=512,
-                          C_fc2_dims=256, C_fc3_dims=128, A_fc1_dims=256, A_fc2_dims=128, batch_size=64, n_agents=1)
-        obs, obs_j = self.envs.envs[0].env.reset()
-        self.warmup(obs)
+        agent_j = TD3(self.alpha, self.beta, self.n_input_j, self.n_output_j)
+        # agent_j = Agent_J(self.alpha, self.beta, self.n_input_j, self.tau, self.n_output_j, gamma=0.99, max_size=10000,
+        #                   C_fc1_dims=512,
+        #                   C_fc2_dims=256, C_fc3_dims=128, A_fc1_dims=256, A_fc2_dims=128, batch_size=64, n_agents=1)
+        # 初始化环境状态
+        obs, obs_j = self.envs.envs[0].env.reset()  # 每个agent的state都是一样的，直接用这个act
+        self.warmup(obs)  # 初始化环境的状态
 
         start = time.time()
+        # print(int(self.num_env_steps), self.episode_length, self.n_rollout_threads)
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
-
+        print('总迭代次数：', episodes)
+        print('评估间隔：', self.eval_interval)
         reward_list = []
         rate_list = []
-        jain_list = []
+        Beta_t_list = []
         kl_1_list = []
         lr_1_list = []
         v_L_list = []
@@ -48,174 +66,140 @@ class EnvRunner(Runner):
         Noise_list = []
         Cei_1_list = []
         Cei_2_list = []
+        Cei_3_list = []
         J_Entropy_list = []
         Ers_1_list = []
         Ers_2_list = []
-        user_rate_1_list = []
-        user_rate_2_list = []
-        user_rate_3_list = []
-        user_rate_4_list = []
-        user_rate_5_list = []
-        powerin_list = []
+        Ers_3_list = []
 
         for episode in range(episodes):
             if self.use_linear_lr_decay:
-                self.trainer.policy.lr_decay(episode, episodes)
+                self.trainer.policy.lr_decay(episode, episodes)  # 学习率逐渐衰减
             done = False
             self.epsilon = 0
+            # vary_L = 4 + 6 * (episode / episodes)  # 新范围：5 ~ 10
             vary_L = 10.0
             v_L_list.append(vary_L)
+            # vary_noise = 0.01 + 4.99 * (episode / episodes)
             vary_noise = 0
             Noise_list.append(vary_noise)
 
             for step in range(self.episode_length):
                 rewards = []
                 rates = []
-                jain_fairnesss = []
-                rate_1 = []
-                rate_2 = []
-                rate_3 = []
-                rate_4 = []
-                rate_5 = []
-                powers = []
+                betas = []
+                # Sample actions
                 (
                     value_explore,
-                    action_expolit,
-                    action_log_probs_expolit,
                     rnn_states,
                     rnn_states_critic,
-                    actions_BS_expolit,
-                    action_log_probs_BS_expolit,
                     action_explore,
                     action_log_probs_explore,
                     actions_BS_explore,
                     action_log_probs_BS_explore,
                     rnn_states_BS,
+                    actions_MBS_explore,
+                    action_log_probs_MBS_explore,
+                    rnn_states_MBS,
                     action_G,
                     action_phase,
                     action_tau,
-                    value_expolit,
+                    action_Band,
                     self.whether_exploit
                 ) = self.collect(step)
 
+                # print(np.asarray(obs_j).flatten())
                 action_j = agent_j.choose_action(np.asarray(obs_j).flatten())
-                w_theta = action_j[0: self.J * self.K] * np.pi
-                w_beta = (action_j[self.J * self.K: 2 * self.J * self.K] + 1) / 2
+                # print("action_j NaN check:", np.isnan(action_j).any())
+                w_theta = action_j[0: self.J * self.K] * 2 * np.pi
+                w_beta = action_j[self.J * self.K: 2 * self.J * self.K]
                 w_array = np.cos(w_theta) * w_beta + np.sin(w_theta) * w_beta * 1j
                 action_W = np.reshape(w_array, (self.J, self.K))
-                obs_new, reward, dones, infos, obs_j_new, reward_j, sum_rate, jain_fairness, rate_array, power_in = self.envs.envs[0].env.step(action_G, action_phase, np.array(action_tau), action_W)
-                rewards.append(reward)
+                obs_new, glo_reward, dones, infos, obs_j_new, reward_j, sum_rate, beta_t = self.envs.envs[0].env.step(action_G, action_phase, np.array(action_tau),
+                                                                                                          action_W, action_Band)
+                # beta_t = 1 - 1 * (episode / episodes)
+                rewards.append(glo_reward)
                 rates.append(sum_rate)
-                jain_fairnesss.append(jain_fairness)
-                rate_1.append(rate_array[0])
-                rate_2.append(rate_array[1])
-                rate_3.append(rate_array[2])
-                rate_4.append(rate_array[3])
-                rate_5.append(rate_array[4])
-                powers.append(power_in)
+                betas.append(beta_t)
 
                 if step == self.episode_length - 1:
                     dones = [True for _ in range(self.n_agents)]
                     done = True
 
-                data = (obs_new, reward, dones, infos, action_explore, action_log_probs_explore, rnn_states, actions_BS_explore, action_log_probs_BS_explore,
-                    rnn_states_BS, value_explore, rnn_states_critic, action_expolit, actions_BS_expolit, action_log_probs_expolit,
-                           action_log_probs_BS_expolit, value_expolit)
+
+                data = (obs_new, glo_reward, dones, infos, action_explore, action_log_probs_explore, rnn_states, actions_BS_explore, action_log_probs_BS_explore,
+                    rnn_states_BS, actions_MBS_explore, action_log_probs_MBS_explore, rnn_states_MBS, value_explore, rnn_states_critic)
                 self.insert(data)
                 agent_j.remember(np.asarray(obs_j).flatten(), np.asarray(action_j).flatten(),
                                  reward_j, np.asarray(obs_j_new).flatten(), done)
             if episode >= 0:
                 self.compute()
-                if episode <= 4000:
-                    train_infos = self.train_1(vary_L, vary_noise)
+                if episode <= 3000:
+                    train_infos = self.train_1(vary_L, vary_noise, beta_t)
                 else:
                     train_infos = self.train_2(vary_L, vary_noise)
                 agent_j.learn()
+                # obs_j = obs_j_new
+                # obs = obs_new
 
                 total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
+                # train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
                 train_infos["average_episode_rewards"] = np.mean(rewards)
                 self.log_train(train_infos, total_num_steps)
-                kl_1_list.append(train_infos['kl'])
-                lr_1_list.append(train_infos['lr_1'])
-                Bup_1_list.append(train_infos['Bup_1'])
-                Q_error_list.append(train_infos['Q_err'])
-                Cei_1_list.append(train_infos['Cei_1'])
-                Cei_2_list.append(train_infos['Cei_2'])
-                J_Entropy_list.append(train_infos['J_T'])
-                Ers_1_list.append(train_infos['Ers_1'])
-                Ers_2_list.append(train_infos['Ers_2'])
 
             total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
 
+            # save model
             if episode % self.save_interval == 0 or episode == episodes - 1:
+                # print('保存一次模型')
                 self.save()
                 self.save_exploit()
 
+            # log information
             if episode % self.log_interval == 0:
                 end = time.time()
+                print(
+                    "\n Scenario {} Algo {} Exp {} updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n".format(
+                        self.all_args.scenario_name,
+                        self.algorithm_name,
+                        self.experiment_name,
+                        episode,
+                        episodes,
+                        total_num_steps,
+                        self.num_env_steps,
+                        int(total_num_steps / (end - start)),
+                    )
+                )
 
+                print("average episode rewards is ", np.mean(rewards))
+                # print("average episode beta is ", np.mean(betas))
                 reward_list.append(np.mean(rewards))
                 rate_list.append(np.mean(rates))
-                jain_list.append(np.mean(jain_fairnesss))
-                user_rate_1_list.append(np.mean(rate_1))
-                user_rate_2_list.append(np.mean(rate_2))
-                user_rate_3_list.append(np.mean(rate_3))
-                user_rate_4_list.append(np.mean(rate_4))
-                user_rate_5_list.append(np.mean(rate_5))
-                powerin_list.append(np.mean(powers))
+                Beta_t_list.append(np.mean(betas))
+                # print("average episode rates is :", np.mean(rates))
 
+            # eval
             if episode % self.eval_interval == 0 and self.use_eval:
+                print('评估模型一次')
                 self.eval(total_num_steps)
 
-        file_name = 'HMAPPO_reward_35.csv'
+        file_name = 'RPPO_Reward_12.csv'
         with open(file_name, mode='w', newline='') as file:
             writer = csv.writer(file)
             for item in reward_list:
                 writer.writerow([item])
-        file_name = 'HMAPPO_jain_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in jain_list:
-                writer.writerow([item])
-        file_name = 'HMAPPO_rate1_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in user_rate_1_list:
-                writer.writerow([item])
-        file_name = 'HMAPPO_rate2_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in user_rate_2_list:
-                writer.writerow([item])
-        file_name = 'HMAPPO_rate3_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in user_rate_3_list:
-                writer.writerow([item])
-        file_name = 'HMAPPO_rate4_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in user_rate_4_list:
-                writer.writerow([item])
-        file_name = 'HMAPPO_rate5_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in user_rate_5_list:
-                writer.writerow([item])
-        file_name = 'HMAPPO_power_35.csv'
-        with open(file_name, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            for item in powerin_list:
-                writer.writerow([item])
+        print('保存数据成功RMAPPO_12')
+
 
     def warmup(self, obs):
+        # replay buffer
         if self.use_centralized_V:
             obs = np.array(obs)
-            share_obs = np.repeat(obs[np.newaxis, :, :], self.n_rollout_threads, axis=0)
+            share_obs = np.repeat(obs[np.newaxis, :], self.n_rollout_threads, axis=0)
         else:
             share_obs = obs
 
-        self.buffer.share_obs[0] = share_obs[:, :, :10].copy()
+        self.buffer.share_obs[0] = np.repeat(share_obs[:, :6][:, np.newaxis, :], 35, axis=1)
         self.buffer.obs[0] = obs.copy()
 
     @torch.no_grad()
@@ -223,64 +207,46 @@ class EnvRunner(Runner):
         self.trainer.prep_rollout()
         self.trainer_exploit.prep_rollout()
 
+        # target actor 的动作
         (
-                value_expolit,
-                action_expolit,
-                action_log_prob_expolit,
-                rnn_states,
-                action_BS_expolit,
-                action_log_probs_BS_expolit,
-                rnn_states_BS,
-                rnn_states_critic
-        ) = self.trainer_exploit.policy.get_actions(
-                np.concatenate(self.buffer.share_obs[step]),
-                np.concatenate(self.buffer.obs[step]),
-                np.concatenate(self.buffer.rnn_states[step]),
-                np.concatenate(self.buffer.rnn_states_critic[step]),
-                np.concatenate(self.buffer.masks[step]),
-        )
-
-        (
-                value_explore,
-                action_explore,
-                action_log_prob_explore,
-                rnn_states,
-                action_BS_explore,
-                action_log_probs_BS_explore,
-                rnn_states_BS,
-                rnn_states_critic,
+            value_explore,
+            action_explore,
+            action_log_prob_explore,
+            rnn_states,
+            action_BS_explore,
+            action_log_probs_BS_explore,
+            rnn_states_BS,
+            action_MBS_explore,
+            action_log_probs_MBS_explore,
+            rnn_states_MBS,
+            rnn_states_critic,
         ) = self.trainer.policy.get_actions(
-                np.concatenate(self.buffer.share_obs[step]),
-                np.concatenate(self.buffer.obs[step]),
-                np.concatenate(self.buffer.rnn_states[step]),
-                np.concatenate(self.buffer.rnn_states_critic[step]),
-                np.concatenate(self.buffer.masks[step]),
+            np.concatenate(self.buffer.share_obs[step]),
+            np.concatenate(self.buffer.obs[step]),
+            np.concatenate(self.buffer.rnn_states[step]),
+            np.concatenate(self.buffer.rnn_states_critic[step]),
+            np.concatenate(self.buffer.masks[step]),
         )
 
-        value = value_explore + self.epsilon * value_expolit
-        action = action_explore + self.epsilon * action_expolit
-        action_BS = action_BS_explore + self.epsilon * action_BS_expolit
+        value = value_explore
+        action = action_explore
+        action_BS = action_BS_explore
+        action_MBS = action_MBS_explore
 
+        # 分割为各个线程
         rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
         rnn_states_critic = np.array(
             np.split(_t2n(rnn_states_critic), self.n_rollout_threads))
         rnn_states_BS = np.array(
             np.split(_t2n(rnn_states_BS), self.n_rollout_threads))
+        rnn_states_MBS = np.array(
+            np.split(_t2n(rnn_states_MBS), self.n_rollout_threads))
         values = np.array(np.split(_t2n(value), self.n_rollout_threads))
-        value_expolit = np.array(np.split(_t2n(value_expolit), self.n_rollout_threads))
         value_explore = np.array(np.split(_t2n(value_explore), self.n_rollout_threads))
 
         actions = np.array(np.split(_t2n(action), self.n_rollout_threads))
         actions_BS = np.array(np.split(_t2n(action_BS), self.n_rollout_threads))
-
-        action_expolit = np.array(np.split(_t2n(action_expolit), self.n_rollout_threads))
-        action_log_probs_expolit = np.array(
-            np.split(_t2n(action_log_prob_expolit), self.n_rollout_threads)
-        )
-        actions_BS_expolit = np.array(np.split(_t2n(action_BS_expolit), self.n_rollout_threads))
-        action_log_probs_BS_expolit = np.array(
-            np.split(_t2n(action_log_probs_BS_expolit), self.n_rollout_threads)
-        )
+        actions_MBS = np.array(np.split(_t2n(action_MBS), self.n_rollout_threads))
 
         action_explore = np.array(np.split(_t2n(action_explore), self.n_rollout_threads))
         action_log_probs_explore = np.array(
@@ -290,63 +256,94 @@ class EnvRunner(Runner):
         action_log_probs_BS_explore = np.array(
             np.split(_t2n(action_log_probs_BS_explore), self.n_rollout_threads)
         )
+        actions_MBS_explore = np.array(np.split(_t2n(action_MBS_explore), self.n_rollout_threads))
+        action_log_probs_MBS_explore = np.array(
+            np.split(_t2n(action_log_probs_MBS_explore), self.n_rollout_threads)
+        )
 
-        actions_env = actions
-        actions_env_BS = actions_BS
-        action_phase = []
-        action_tau = []
-        actor_action = []
-        for j in range(self.n_agents):
-            if j == self.n_agents - 1:
-                action_BS = np.clip(actions_env_BS[0, j, :], -0.999, 0.999).reshape(-1)
-                g_theta = action_BS[0: self.M * self.K] * np.pi
-                actor_action.extend(g_theta.tolist())
-                g_beta = (action_BS[self.M * self.K: 2 * self.M * self.K] + 1) / 2
-                actor_action.extend(g_beta.tolist())
-                g_array = np.cos(g_theta) * g_beta + np.sin(g_theta) * g_beta * 1j
-                action_G = np.reshape(g_array, (self.M, self.K))
+        # 重构动作处理逻辑以支持多BS场景
+        all_action_G = []
+        all_action_phase = []
+        all_action_tau = []
+        all_actor_action = []
+        all_action_Mbs = []
 
-            else:
-                action_phase.append(np.floor(((actions_env[0, j, 0] + 1) / 2) * (2 ** 3 + 1)) * (2 * np.pi / (2 ** 3)))
-                actor_action.append(np.floor(((actions_env[0, j, 0] + 1) / 2) * (2 ** 3 + 1)) * (2 * np.pi / (2 ** 3)))
-                action_tau.append((actions_env[0, j, 1] + 1) / 2)
-                actor_action.append((actions_env[0, j, 1] + 1) / 2)
+        # 假设每个BS有固定数量的agent (n_agents_per_bs)
+        n_agents_per_bs = self.n_agents // self.num_bs
+
+        for bs_idx in range(self.num_bs):
+            action_G = None
+            action_phase = []
+            action_tau = []
+            actor_action = []
+
+            # 处理当前BS对应的agent动作
+            start_idx = bs_idx * n_agents_per_bs
+            end_idx = (bs_idx + 1) * n_agents_per_bs
+
+            for j in range(start_idx, end_idx):
+                if j == end_idx - 1:  # 每个BS组的最后一个agent处理BS动作
+                    # 处理BS动作
+                    action_BS_clipped = np.clip(actions_BS[0, j, :], -0.999, 0.999).reshape(-1)
+                    g_theta = action_BS_clipped[0: self.M * self.K] * np.pi
+                    actor_action.extend(g_theta.tolist())
+                    g_beta = (action_BS_clipped[self.M * self.K: 2 * self.M * self.K] + 1) / 2
+                    actor_action.extend(g_beta.tolist())
+                    g_array = np.cos(g_theta) * g_beta + np.sin(g_theta) * g_beta * 1j
+                    action_G = np.reshape(g_array, (self.M, self.K))
+                else:
+                    # 处理RIS相位和tau动作
+                    phase = np.floor(((actions[0, j, 0] + 1) / 2) * (2 ** 3 + 1)) * (2 * np.pi / (2 ** 3))
+                    action_phase.append(phase)
+                    actor_action.append(phase)
+
+                    tau = (actions[0, j, 1] + 1) / 2
+                    action_tau.append(tau)
+                    actor_action.append(tau)
+
+            all_action_G.append(action_G)
+            all_action_phase.append(action_phase)
+            all_action_tau.append(action_tau)
+            all_actor_action.append(actor_action)
+
+        action_Band = self.B * (action_MBS[0] + 1) / torch.sum((action_MBS[0] + 1))
 
         return (
             value_explore,
-            action_expolit,
-            action_log_probs_expolit,
             rnn_states,
             rnn_states_critic,
-            actions_BS_expolit,
-            action_log_probs_BS_expolit,
             action_explore,
             action_log_probs_explore,
             actions_BS_explore,
             action_log_probs_BS_explore,
             rnn_states_BS,
-            action_G,
-            action_phase,
-            action_tau,
-            value_expolit,
+            actions_MBS_explore,
+            action_log_probs_MBS_explore,
+            rnn_states_MBS,
+            all_action_G,  # 改为返回所有BS的G动作列表
+            all_action_phase,  # 改为返回所有BS的phase动作列表
+            all_action_tau,  # 改为返回所有BS的tau动作列表
+            action_Band,
             self.whether_exploit
         )
 
     def insert(self, data):
         (obs_new, reward, dones, infos, actions, action_log_probs, rnn_states, actions_BS, action_log_probs_BS,
-                rnn_states_BS, values, rnn_states_critic,  actions_exploit, actions_BS_exploit, action_log_probs_exploit,
-                           action_log_probs_BS_exploit, value_preds_exploit) = data
+                rnn_states_BS, actions_MBS, action_log_probs_MBS, rnn_states_MBS, values, rnn_states_critic) = data
 
         masks = np.ones((self.n_rollout_threads, self.n_agents, 1), dtype=np.float32)
+        # masks[dones == True] = np.zeros((sum(dones), 1), dtype=np.float32)
+
 
         if self.use_centralized_V:
-            share_obs = np.tile(obs_new, (self.n_rollout_threads, 1, 1))
+            # share_obs = obs_new.reshape(self.n_rollout_threads, -1)
+            share_obs = np.tile(obs_new, (self.n_rollout_threads, 1, 1))  # 直接复制32次
+            # share_obs = np.expand_dims(share_obs, 1).repeat(self.n_agents, axis=1)
         else:
             share_obs = obs_new
 
-        self.buffer.insert(share_obs, obs_new, rnn_states, rnn_states_BS, rnn_states_critic, actions, actions_BS, action_log_probs,
-                           action_log_probs_BS, values, reward, masks, actions_exploit, actions_BS_exploit, action_log_probs_exploit,
-                           action_log_probs_BS_exploit, value_preds_exploit)
+        self.buffer.insert(share_obs, obs_new, rnn_states, rnn_states_BS, rnn_states_MBS, rnn_states_critic, actions, actions_BS, actions_MBS, action_log_probs,
+                           action_log_probs_BS, action_log_probs_MBS, values, reward, masks)
 
     @torch.no_grad()
     def eval(self, total_num_steps):
@@ -384,6 +381,7 @@ class EnvRunner(Runner):
             else:
                 raise NotImplementedError
 
+            # Obser reward and next obs
             eval_obs, eval_rewards, eval_dones, eval_infos = self.eval_envs.step(eval_actions_env)
             eval_episode_rewards.append(eval_rewards)
 
@@ -398,10 +396,12 @@ class EnvRunner(Runner):
         eval_env_infos = {}
         eval_env_infos["eval_average_episode_rewards"] = np.sum(np.array(eval_episode_rewards), axis=0)
         eval_average_episode_rewards = np.mean(eval_env_infos["eval_average_episode_rewards"])
+        print("eval average episode rewards of agent: " + str(eval_average_episode_rewards))
         self.log_env(eval_env_infos, total_num_steps)
 
     @torch.no_grad()
     def render(self):
+        """Visualize the env."""
         envs = self.envs
 
         all_frames = []
@@ -451,6 +451,7 @@ class EnvRunner(Runner):
                 else:
                     raise NotImplementedError
 
+                # Obser reward and next obs
                 obs, rewards, dones, infos = envs.step(actions_env)
                 episode_rewards.append(rewards)
 
@@ -470,3 +471,8 @@ class EnvRunner(Runner):
                         time.sleep(self.all_args.ifi - elapsed)
                 else:
                     envs.render("human")
+
+            print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
+
+        # if self.all_args.save_gifs:
+        #     imageio.mimsave(str(self.gif_dir) + '/render.gif', all_frames, duration=self.all_args.ifi)

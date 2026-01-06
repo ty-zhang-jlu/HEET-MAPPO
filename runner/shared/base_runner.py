@@ -1,14 +1,21 @@
 import os
 import numpy as np
 import torch
-from global_mappo_1.utils.shared_buffer import SharedReplayBuffer
+# from tensorboardX import SummaryWriter
+from global_mappo.utils.shared_buffer import SharedReplayBuffer
 
 
 def _t2n(x):
+    """Convert torch tensor to a numpy array."""
     return x.detach().cpu().numpy()
 
 
 class Runner(object):
+    """
+    Base class for training recurrent policies.
+    :param config: (dict) Config dictionary containing parameters for training.
+    """
+
     def __init__(self, config):
 
         self.all_args = config['all_args']
@@ -19,6 +26,7 @@ class Runner(object):
         if config.__contains__("render_envs"):
             self.render_envs = config['render_envs']
 
+            # parameters
         self.env_name = self.all_args.env_name
         self.algorithm_name = self.all_args.algorithm_name
         self.experiment_name = self.all_args.experiment_name
@@ -34,29 +42,33 @@ class Runner(object):
         self.use_render = self.all_args.use_render
         self.recurrent_N = self.all_args.recurrent_N
 
+        # interval
         self.save_interval = self.all_args.save_interval
         self.use_eval = self.all_args.use_eval
         self.eval_interval = self.all_args.eval_interval
         self.log_interval = self.all_args.log_interval
 
+        # dir
         self.model_dir = self.all_args.model_dir
 
         self.run_dir = config["run_dir"]
         self.log_dir = str(self.run_dir / 'logs')
         if not os.path.exists(self.log_dir):
             os.makedirs(self.log_dir)
+        # self.writter = SummaryWriter(self.log_dir)
         self.save_dir = str(self.run_dir / 'models')
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
-        from global_mappo_1.algorithms.algorithm.r_mappo import RMAPPO as TrainAlgo
-        from global_mappo_1.algorithms.algorithm.rMAPPOPolicy import RMAPPOPolicy as Policy
-        from global_mappo_1.algorithms.algorithm.r_mappo_exploit import RMAPPO_exploit as TrainAlgo_exploit
-        from global_mappo_1.algorithms.algorithm.rMAPPOPolicy_exploit import RMAPPOPolicy_exploit as Policy_exploit
+        from global_mappo.algorithms.algorithm.r_mappo import RMAPPO as TrainAlgo
+        from global_mappo.algorithms.algorithm.rMAPPOPolicy import RMAPPOPolicy as Policy
+        from global_mappo.algorithms.algorithm.r_mappo_exploit import RMAPPO_exploit as TrainAlgo_exploit
+        from global_mappo.algorithms.algorithm.rMAPPOPolicy_exploit import RMAPPOPolicy_exploit as Policy_exploit
 
         share_observation_space = self.envs.share_observation_space[0] if self.use_centralized_V else \
         self.envs.observation_space[0]
 
+        # policy network
         self.policy = Policy(self.all_args,
                              self.envs.observation_space[0],
                              share_observation_space,
@@ -71,9 +83,11 @@ class Runner(object):
         if self.model_dir is not None:
             self.restore()
 
+        # algorithm
         self.trainer = TrainAlgo(self.all_args, self.policy, device=self.device)
         self.trainer_exploit = TrainAlgo_exploit(self.all_args, self.policy_exploit, device=self.device)
 
+        # buffer
         self.buffer = SharedReplayBuffer(self.all_args,
                                          self.num_agents,
                                          self.envs.observation_space[0],
@@ -81,19 +95,27 @@ class Runner(object):
                                          self.envs.envs[0].env.action_dim)
 
     def run(self):
+        """Collect training data, perform training updates, and evaluate policy."""
         raise NotImplementedError
 
     def warmup(self):
+        """Collect warmup pre-training data."""
         raise NotImplementedError
 
     def collect(self, step):
+        """Collect rollouts for training."""
         raise NotImplementedError
 
     def insert(self, data):
+        """
+        Insert data into buffer.
+        :param data: (Tuple) data to insert into training buffer.
+        """
         raise NotImplementedError
 
     @torch.no_grad()
     def compute(self):
+        """Calculate returns for the collected data."""
         self.trainer.prep_rollout()
         next_values = self.trainer.policy.get_values(np.concatenate(self.buffer.share_obs[-1]),np.concatenate(self.buffer.actions[-1]),
                                                      np.concatenate(self.buffer.rnn_states_critic[-1]),
@@ -102,6 +124,7 @@ class Runner(object):
         self.buffer.compute_returns(next_values, self.trainer.value_normalizer)
 
     def compute_exploit(self):
+        """Calculate returns for the collected data."""
         self.trainer_exploit.prep_rollout()
         next_values = self.trainer_exploit.policy.get_values(np.concatenate(self.buffer.share_obs[-1]),
                                                              np.concatenate(self.buffer.rnn_states_critic[-1]),
@@ -109,37 +132,43 @@ class Runner(object):
         next_values = np.array(np.split(_t2n(next_values), self.n_rollout_threads))
         self.buffer.compute_returns(next_values, self.trainer_exploit.value_normalizer)
 
-    def train_1(self, vary_L, vary_noise):
+    def train_1(self, vary_L, vary_noise, beta_t):
+        """Train policies with data in buffer. """
         self.trainer.prep_training()
-        train_infos = self.trainer.train_1(self.buffer, vary_L, vary_noise)
+        train_infos = self.trainer.train_1(self.buffer, vary_L, vary_noise, beta_t)
         self.buffer.after_update()
         return train_infos
 
     def train_2(self, vary_L, vary_noise):
+        """Train policies with data in buffer. """
         self.trainer.prep_training()
         train_infos = self.trainer.train_2(self.buffer, vary_L, vary_noise)
         self.buffer.after_update()
         return train_infos
 
     def train_exploit(self, vary_L, vary_noise):
+        """Train policies with data in buffer. """
         self.trainer_exploit.prep_training()
         train_infos_exploit = self.trainer_exploit.train(self.buffer, vary_L, vary_noise)
         self.buffer.after_update()
         return train_infos_exploit
 
     def save(self):
+        """Save policy's actor and critic networks."""
         policy_actor = self.trainer.policy.actor
         torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor.pt")
         policy_critic = self.trainer.policy.critic
         torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic.pt")
 
     def save_exploit(self):
+        """Save policy's actor and critic networks."""
         policy_actor_exploit = self.trainer_exploit.policy.actor
         torch.save(policy_actor_exploit.state_dict(), str(self.save_dir) + "/actor.pt")
         policy_critic_exploit = self.trainer_exploit.policy.critic
         torch.save(policy_critic_exploit.state_dict(), str(self.save_dir) + "/critic.pt")
 
     def restore(self):
+        """Restore policy's networks from a saved model."""
         policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor.pt')
         self.policy.actor.load_state_dict(policy_actor_state_dict)
         if not self.all_args.use_render:
@@ -147,6 +176,7 @@ class Runner(object):
             self.policy.critic.load_state_dict(policy_critic_state_dict)
 
     def restore_exploit(self):
+        """Restore policy's networks from a saved model."""
         policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor.pt')
         self.policy.actor.load_state_dict(policy_actor_state_dict)
         if not self.all_args.use_render:
