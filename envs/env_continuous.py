@@ -1,5 +1,5 @@
 import numpy as np
-from global_mappo_1.envs.env_core import EnvCore
+from global_matd3.envs.env_core import EnvCore
 
 
 class ContinuousActionEnv(object):
@@ -22,6 +22,7 @@ class ContinuousActionEnv(object):
         self.action_space = [[] for _ in range(self.num_agent)]
         self.observation_space = [[] for _ in range(self.num_agent)]
         self.share_observation_space = np.zeros((self.num_agent, self.signal_obs_dim), dtype=np.float32)  # 假设所有智能体共享一个全局观察空间
+
 
         # 初始化动作空间和观察空间
         for i in range(self.num_agent):

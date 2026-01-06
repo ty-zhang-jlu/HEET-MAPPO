@@ -2,7 +2,6 @@ from .distributions import Bernoulli, Categorical, DiagGaussian
 import torch
 import torch.nn as nn
 
-
 class ACTLayer(nn.Module):
     """
     MLP Module to compute actions.
@@ -11,7 +10,6 @@ class ACTLayer(nn.Module):
     :param use_orthogonal: (bool) whether to use orthogonal initialization.
     :param gain: (float) gain of the output layer of the network.
     """
-
     def __init__(self, action_space, inputs_dim, use_orthogonal, gain):
         super(ACTLayer, self).__init__()
         self.mixed_action = False
@@ -21,10 +19,8 @@ class ACTLayer(nn.Module):
         self.continuous_action = True
         action_dim = action_space
         self.action_out = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
-        self.action_out_BS = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
-        self.action_out_joint = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
-
-    def forward(self, x, available_actions=None, deterministic=False, noise_scale=0.01):
+    
+    def forward(self, x, available_actions=None, deterministic=False):
         """
         Compute actions and action logprobs from given input.
         :param x: (torch.Tensor) input to network.
@@ -35,11 +31,46 @@ class ACTLayer(nn.Module):
         :return actions: (torch.Tensor) actions to take.
         :return action_log_probs: (torch.Tensor) log probabilities of taken actions.
         """
-        action_logit = self.action_out(x)
-        actions = action_logit.mode() if deterministic else action_logit.sample()
-        # actions = torch.tanh(actions)  # 将动作限制在 [-1, 1] 范围内
-        action_log_probs = action_logit.log_probs(actions)
+        if self.mixed_action:
+            actions = []
+            action_log_probs = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                action = action_logit.mode() if deterministic else action_logit.sample()
+                action_log_prob = action_logit.log_probs(action)
+                actions.append(action.float())
+                action_log_probs.append(action_log_prob)
 
+            actions = torch.cat(actions, -1)
+            action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+
+        elif self.multi_discrete:
+            actions = []
+            action_log_probs = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                action = action_logit.mode() if deterministic else action_logit.sample()
+                action_log_prob = action_logit.log_probs(action)
+                actions.append(action)
+                action_log_probs.append(action_log_prob)
+
+            actions = torch.cat(actions, -1)
+            action_log_probs = torch.cat(action_log_probs, -1)
+        elif self.continuous_action:
+            # actions = []
+            # action_log_probs = []
+            action_logit = self.action_out(x)
+            actions = action_logit.mode() if deterministic else action_logit.sample()
+            action_log_probs = action_logit.log_probs(actions)
+            # actions.append(action.float())
+            # action_log_probs.append(action_log_prob)
+            # actions = torch.cat(actions, -1)
+            # action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+        else:
+            action_logits = self.action_out(x, available_actions)
+            actions = action_logits.mode() if deterministic else action_logits.sample() 
+            action_log_probs = action_logits.log_probs(actions)
+        
         return actions, action_log_probs
 
     def get_probs(self, x, available_actions=None):
@@ -51,9 +82,17 @@ class ACTLayer(nn.Module):
 
         :return action_probs: (torch.Tensor)
         """
-        action_logits = self.action_out(x, available_actions)
-        action_probs = action_logits.probs
-
+        if self.mixed_action or self.multi_discrete:
+            action_probs = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                action_prob = action_logit.probs
+                action_probs.append(action_prob)
+            action_probs = torch.cat(action_probs, -1)
+        else:
+            action_logits = self.action_out(x, available_actions)
+            action_probs = action_logits.probs
+        
         return action_probs
 
     def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
@@ -62,83 +101,74 @@ class ACTLayer(nn.Module):
         :param x: (torch.Tensor) input to network.
         :param action: (torch.Tensor) actions whose entropy and log probability to evaluate.
         :param available_actions: (torch.Tensor) denotes which actions are available to agent
-                                  (if None, all actions available)
+                                                              (if None, all actions available)
         :param active_masks: (torch.Tensor) denotes whether an agent is active or dead.
 
         :return action_log_probs: (torch.Tensor) log probabilities of the input actions.
         :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
         """
-        # 检查输入数据
-        action_log_probs = []
-        dist_entropy = []
-        # 计算动作分布
-        action_logit = self.action_out(x)
-        # 检查动作分布参数
-        if torch.isnan(action_logit.loc).any() or torch.isinf(action_logit.loc).any():
-            raise ValueError("Action distribution loc contains NaN or inf values.")
-        if torch.isnan(action_logit.scale).any() or torch.isinf(action_logit.scale).any():
-            raise ValueError("Action distribution scale contains NaN or inf values.")
-        # 计算动作对数概率
-        action_log_probs.append(action_logit.log_probs(action))
-        entropy = action_logit.entropy()
-        # 计算熵
-        if active_masks is not None:
-            if len(action_logit.entropy().shape) == len(active_masks.shape):
-                dist_entropy.append((action_logit.entropy() * active_masks).sum() / active_masks.sum())
+        if self.mixed_action:
+            a, b = action.split((2, 1), -1)
+            b = b.long()
+            action = [a, b] 
+            action_log_probs = [] 
+            dist_entropy = []
+            for action_out, act in zip(self.action_outs, action):
+                action_logit = action_out(x)
+                action_log_probs.append(action_logit.log_probs(act))
+                if active_masks is not None:
+                    if len(action_logit.entropy().shape) == len(active_masks.shape):
+                        dist_entropy.append((action_logit.entropy() * active_masks).sum()/active_masks.sum()) 
+                    else:
+                        dist_entropy.append((action_logit.entropy() * active_masks.squeeze(-1)).sum()/active_masks.sum())
+                else:
+                    dist_entropy.append(action_logit.entropy().mean())
+                
+            action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+            dist_entropy = dist_entropy[0] / 2.0 + dist_entropy[1] / 0.98 #! dosen't make sense
+
+        elif self.multi_discrete:
+            action = torch.transpose(action, 0, 1)
+            action_log_probs = []
+            dist_entropy = []
+            for action_out, act in zip(self.action_outs, action):
+                action_logit = action_out(x)
+                action_log_probs.append(action_logit.log_probs(act))
+                if active_masks is not None:
+                    dist_entropy.append((action_logit.entropy()*active_masks.squeeze(-1)).sum()/active_masks.sum())
+                else:
+                    dist_entropy.append(action_logit.entropy().mean())
+
+            action_log_probs = torch.cat(action_log_probs, -1) # ! could be wrong
+            dist_entropy = torch.tensor(dist_entropy).mean()
+
+        elif self.continuous_action:
+            # a, b = action.split((2, 1), -1)
+            # b = b.long()
+            # action = [a, b]
+            action_log_probs = []
+            dist_entropy = []
+            # for action_out, act in zip(self.action_outs, action):
+            action_logit = self.action_out(x)
+            action_log_probs.append(action_logit.log_probs(action))
+            if active_masks is not None:
+                if len(action_logit.entropy().shape) == len(active_masks.shape):
+                    dist_entropy.append((action_logit.entropy() * active_masks).sum() / active_masks.sum())
+                else:
+                    dist_entropy.append(
+                        (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
             else:
-                dist_entropy.append(
-                    (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
+                dist_entropy.append(action_logit.entropy().mean())
+
+            action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+            dist_entropy = dist_entropy[0] # / 2.0 + dist_entropy[1] / 0.98  # ! dosen't make sense
+
         else:
-            dist_entropy.append(action_logit.entropy().mean())
-
-        # 合并结果
-        action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
-        dist_entropy = dist_entropy[0]  # 取第一个熵值
-        grad_ent = torch.autograd.grad(entropy.mean(), [action_logit.loc, action_logit.scale], retain_graph=True, allow_unused=True)
-
-        return action_log_probs, entropy.mean(), grad_ent
-
-    def evaluate_actions_BS(self, x, action, available_actions=None, active_masks=None):
-
-        action_log_probs = []
-        dist_entropy = []
-        # for action_out, act in zip(self.action_outs, action):
-        action_logit = self.action_out_BS(x)
-        action_log_probs.append(action_logit.log_probs(action))
-        entropy = action_logit.entropy()
-        if active_masks is not None:
-            if len(action_logit.entropy().shape) == len(active_masks.shape):
-                dist_entropy.append((action_logit.entropy() * active_masks).sum() / active_masks.sum())
+            action_logits = self.action_out(x, available_actions)
+            action_log_probs = action_logits.log_probs(action)
+            if active_masks is not None:
+                dist_entropy = (action_logits.entropy()*active_masks.squeeze(-1)).sum()/active_masks.sum()
             else:
-                dist_entropy.append(
-                    (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
-        else:
-            dist_entropy.append(action_logit.entropy().mean())
-
-        action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
-        dist_entropy = dist_entropy[0]  # / 2.0 + dist_entropy[1] / 0.98  # ! dosen't make sense
-        grad_ent_2 = torch.autograd.grad(entropy.mean(), [action_logit.loc, action_logit.scale], retain_graph=True,
-                                       allow_unused=True)
-
-        return action_log_probs, entropy.mean(), grad_ent_2
-
-    def evaluate_actions_joint(self, x, action, available_actions=None, active_masks=None):
-        action_log_probs = []
-        dist_entropy = []
-        # for action_out, act in zip(self.action_outs, action):
-        action_logit = self.action_out_joint(x)
-        action_log_probs.append(action_logit.log_probs(action))
-        entropy = action_logit.entropy()
-        if active_masks is not None:
-            if len(action_logit.entropy().shape) == len(active_masks.shape):
-                dist_entropy.append((action_logit.entropy() * active_masks).sum() / active_masks.sum())
-            else:
-                dist_entropy.append(
-                    (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
-        else:
-            dist_entropy.append(action_logit.entropy().mean())
-
-        action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
-        dist_entropy = dist_entropy[0]  # / 2.0 + dist_entropy[1] / 0.98  # ! dosen't make sense
-
-        return action_log_probs, entropy
+                dist_entropy = action_logits.entropy().mean()
+        
+        return action_log_probs, dist_entropy

@@ -21,6 +21,9 @@ class DummyVecEnv():
         self.action_phase = None
         self.action_tau = None
         self.action_W = None
+        self.M = 4
+        self.K = 5
+        self.action_dim = [2, 2 * self.M * self.K]
 
     def step(self, action_G, action_phase, action_tau, action_W):
         """
