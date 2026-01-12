@@ -2,101 +2,262 @@ import numpy as np
 import math
 from scipy.stats import gaussian_kde
 import random
+import torch
 
 
 class EnvCore(object):
+    """
+    # 环境中的智能体 - 多基站多Jammer版本
+    """
+
     def __init__(self):
-        self.M = 4
-        self.N = 16
-        self.K = 5
-        self.Z = 10
-        self.c1 = 9.61
-        self.c2 = 0.16
-        self.kappa = 0.15
-        self.lambda_c = 35/3
-        self.dR = self.lambda_c/2
-        self.dB = self.lambda_c/2
-        self.dJ = self.lambda_c/2
-        self.P_tx = 100
-        self.sigma_noise = 10**(-10.2)
-        self.RIS_height = 400
+        self.M = 4  # 每个BS的天线数量
+        self.N = 8  # 每个RIS的元件数量
+        self.K = 5  # 每个BS服务的用户数量
+        self.Z = 5  # 障碍物数量
+        self.c1 = 11.95  # 环境常数1
+        self.c2 = 0.136  # 环境常数2
+        self.kappa = 0.15  # 障碍物密度
+        self.dR = 0.1  # RIS元件间距
+        self.dB = 0.2  # BS天线间距
+        self.lambda_c = 35 / 3  # 载波波长
+        self.P_tx = 700  # 发射功率
+        self.sigma_noise = 10 ** (-13)  # 噪声功率谱密度
+        self.RIS_height = 500  # RIS高度
         self.Sigma2BR = 0.01
         self.Sigma2RU = 0.01
-        self.K_BR = 2
-        self.K_RU = 2
-        self.Sigma_csi = 0.01
+        self.K_BR = 3.5
+        self.K_RU = 2.2
+        self.Sigma_csi = 0.02
         self.beta_min = 0.2
         self.theta_bar = 0.1
         self.kappa_bar = 0.4
-        self.db_min = 14.9
-        self.pin_min = 40
-        self.yita = 0.7
-        self.Jammer_position = [400, 400, 400]
-        self.P_Jammer = 0.5
-        self.J = 5
-        self.Sigma_csi_Jammer = 0.01
-        self.L0 = 10**(-30/10)
-        self.alpha = 2.2
-        self.theta = 100
+        self.db_min = 2
+        self.pin_min = 20
+        self.yita = 0.9
+        self.P_Jammer = 0.5  # Jammer发射功率约束
+        self.J = 3  # Jammer天线数量
+        self.Sigma_csi_Jammer = 0.02  # Jammer处CSI error
+        self.dJ = 0.2  # Jammer天线间距
 
-        self.agent_num = self.N + 1
-        self.obs_dim = self.K + 2
-        self.action_dim = [2, 2 * self.M * self.K]
+        # 新增参数
+        self.num_bs = 1  # 基站数量
+        self.B = 1 * self.num_bs  # 总带宽(MHz)
+
+        self.agent_num = (self.N + 1) * self.num_bs  # 设置智能体的个数(每个BS-RIS组)
+        self.obs_dim = self.num_bs * 2  # 设置智能体的观测维度
+        self.action_dim = [2, 2 * self.M * self.K, self.num_bs]  # 设置智能体的动作维度
         self.done = False
+        self.update = True
 
-        self.BS_position = np.array([0, 0, 10])
-        self.user_positions = np.random.rand(self.K, 3) * np.array([[500, 500, 2 - 0.5]]) + np.array([[0, 0, 0.5]])
-        self.RIS_center_position = self.determine_ris_position_via_kde()
-        random_offsets = np.arange(self.N)[:, np.newaxis] * self.dR * (np.random.rand(self.N, 2) - 0.5)
-        self.RIS_element_positions = self.RIS_center_position + random_offsets
-        self.RIS_element_positions = np.hstack((self.RIS_element_positions, np.full((self.N, 1), self.RIS_height)))
-        self.obstacle_positions = np.random.rand(self.Z, 3) * np.array([[500, 500, 0]]) + np.array([[0, 0, 0]])
-        self.obstacle_sizes = np.random.rand(self.Z, 3) * np.array([[5, 5, 3.75]]) + np.array([[5, 5, 1.25]])
+        # 初始化多个基站、Jammer和用户位置
+        self.BS_positions = []
+        self.Jammer_positions = []
+        self.user_positions_list = []
+        self.RIS_center_positions = []
+        self.RIS_element_positions_list = []
+
+        for bs_idx in range(self.num_bs):
+            # 基站位置 - 在500x500区域内均匀分布
+            bs_pos = np.array([600 * (bs_idx % 3), 600 * (bs_idx // 3), 10])
+            self.BS_positions.append(bs_pos)
+
+            # Jammer位置 - 在基站附近随机分布，高度与RIS相同
+            jammer_pos = bs_pos + np.array(
+                [random.uniform(1000, 200), random.uniform(1000, 200), self.RIS_height - bs_pos[2]])
+            self.Jammer_positions.append(jammer_pos)
+
+            # 用户位置 - 围绕各自基站随机分布
+            user_positions = np.random.rand(self.K, 3) * np.array([[200, 200, 2 - 0.5]]) + \
+                             np.array([bs_pos[0] - 100, bs_pos[1] - 100, 0.5])
+            self.user_positions_list.append(user_positions)
+
+            # RIS位置 - 基于用户分布确定
+            ris_center = self.determine_ris_position_via_kde(user_positions)
+            self.RIS_center_positions.append(ris_center)
+
+            # RIS元件位置
+            random_offsets = np.arange(self.N)[:, np.newaxis] * self.dR * (np.random.rand(self.N, 2) - 0.5)
+            ris_element_positions = ris_center + random_offsets
+            ris_element_positions = np.hstack((ris_element_positions, np.full((self.N, 1), self.RIS_height)))
+            self.RIS_element_positions_list.append(ris_element_positions)
+
+        # 初始化障碍物位置 (共享的障碍物环境)
+        self.obstacle_positions = np.random.rand(self.Z, 3) * np.array([[1500, 1500, 0]]) + np.array(
+            [[0, 0, 0]])  # 障碍物随机分布在1500x1500的区域内，高度在1.25-5m
+        self.obstacle_sizes = np.random.rand(self.Z, 3) * np.array([[5, 5, 3.75]]) + np.array(
+            [[5, 5, 1.25]])  # 障碍物尺寸随机分布在1-2m长和宽，1.25-5m高
         self.ave_l = np.mean(self.obstacle_sizes[:, 0])
         self.ave_w = np.mean(self.obstacle_sizes[:, 1])
         self.ave_h = np.mean(self.obstacle_sizes[:, 2])
 
-
     def reset(self):
         state_old_all = []
+        state_old_all_j = []
 
-        sum_rate_0 = random.uniform(0, 50)
-        sum_power_in_0 = random.uniform(0, 80)
-        rate_min_0 = np.log2(1 + 10 ** (self.db_min / 10))
-        rate_list_0 = [random.uniform(0, 5) for _ in range(self.K)]
-        h_k_list_0 = [random.uniform(0, 1) for _ in range(self.K)]
+        for bs_idx in range(self.num_bs):
+            sum_rate_0 = random.uniform(0, 50)
+            sum_power_in_0 = random.uniform(0, 40)
+            rate_min_0 = np.log2(1 + 10 ** (6 / 10))
+            rate_list_0 = [random.uniform(0, 5) for _ in range(self.K)]
+            h_k_list_0 = [random.uniform(0, 1) for _ in range(self.K)]
 
-        for i in range(self.agent_num):
-            sub_obs = self.get_state(sum_power_in_0, h_k_list_0)
+            sub_obs = self.get_state(sum_power_in_0, h_k_list_0, bs_idx)  # 每个agent的观察空间一致
             state_old_all.append(sub_obs)
+            state_old_all_flattened = np.concatenate(state_old_all)
 
-        state_old_all_j = self.get_state_for_jammer(1 / sum_rate_0)
-        return state_old_all, state_old_all_j
+            # Jammer的状态只包含对应BS的信息
+            state_old_all_j.append(self.get_state_for_jammer(1 / sum_rate_0, bs_idx))
 
-    def step(self, action_G, action_phase,action_tau, action_W):
+        return state_old_all_flattened, state_old_all_j[0]
+
+    def step(self, actions_G, actions_phase, actions_tau, actions_W, actions_bandwidth):
+        # actions_bandwidth: 每个基站分配的带宽列表，形状为(num_bs,)
+        self.update = True
+
         if self.done:
-            sub_agent_done = [True for _ in range(self.agent_num)]
+            sub_agent_done = [True for _ in range(self.agent_num * self.num_bs)]
             sub_agent_obs, j_agent_obs = self.reset()
-            sub_agent_reward = [[0.] for _ in range(self.agent_num)]
-            j_agent_reward = [0.]
-            sub_agent_info = [{} for _ in range(self.agent_num)]
-            sub_sum_rate = [0.]
+            sub_agent_reward = [[0.] for _ in range(self.agent_num * self.num_bs)]
+            j_agent_reward = 0.
+            sub_agent_info = [{} for _ in range(self.agent_num * self.num_bs)]
+            sub_sum_rate = [0. for _ in range(self.num_bs)]
+            global_reward = 0.
+            Beta_t = 0.
 
-            return [sub_agent_obs, sub_agent_reward, sub_agent_done, sub_agent_info, j_agent_obs, j_agent_reward, sub_sum_rate]
+            return [sub_agent_obs, sub_agent_reward, sub_agent_done, sub_agent_info,
+                    j_agent_obs, j_agent_reward, sub_sum_rate, global_reward, Beta_t]
+
+        global_reward = 0
+        all_sub_agent_reward = []
+        all_sub_agent_obs = []
+        all_j_agent_reward = []
+        all_j_agent_obs = []
+        all_sub_sum_rate = []
+        all_sum_power_in = []
+        all_rate_list = []
 
 
-        sub_agent_reward, sub_agent_obs, j_agent_reward, j_agent_obs, sub_sum_rate, sub_agent_fair, sub_rate, sub_power = self.calculate_reward(action_G, action_phase,
-                                                                                                             action_tau, action_W)
-        sub_agent_done = [False for _ in range(self.agent_num)]
-        sub_agent_info = [{} for _ in range(self.agent_num)]
+        for bs_idx in range(self.num_bs):
+            # 获取当前基站对应的动作
+            action_G = actions_G[bs_idx]
+            action_phase = actions_phase[bs_idx]
+            action_tau = actions_tau[bs_idx]
+            action_W = actions_W
+            bandwidth = actions_bandwidth[bs_idx]  # 当前基站分配的带宽
 
-        return [sub_agent_obs, sub_agent_reward, sub_agent_done, sub_agent_info, j_agent_obs, j_agent_reward, sub_sum_rate, sub_agent_fair, sub_rate, sub_power]
+            # 计算奖励和状态
+            reward, next_state, j_reward, next_state_j, sum_rate, sum_power_in, rate_list = self.calculate_reward(
+                action_G, action_phase, action_tau, action_W, bs_idx, bandwidth)
 
+            global_reward += reward  # 累加所有基站的总速率
+            all_sum_power_in.append(sum_power_in)
+            all_rate_list.append(rate_list)
 
-    def determine_ris_position_via_kde(self):
-        users_xy = self.user_positions[:, :2]
+            all_sub_agent_reward.extend([reward])  # 每个基站有agent_num个智能体
+            all_sub_agent_obs.extend([next_state])
+            all_j_agent_reward.append(j_reward)
+            all_j_agent_obs.append(next_state_j)
+            all_sub_sum_rate.append(sum_rate)
+        all_sub_agent_obs = np.sum(all_sub_agent_obs)
+        # print("全局奖励：", global_reward)
+
+        sub_agent_done = [False for _ in range(self.agent_num * self.num_bs)]
+        sub_agent_info = [{} for _ in range(self.agent_num * self.num_bs)]
+
+        sigma = 0.1  # 可调整为类参数或从外部传入
+
+        # 收集所有用户的截断速率（式35）
+        all_truncated_rates = []
+        for bs_power in all_sum_power_in:
+            if bs_power < self.pin_min:
+                # 只要有一个基站不满足条件，就设置标志为 False 并退出循环
+                self.update = False
+                # print(self.update)
+                break
+        # for bs_idx in range(self.num_bs):
+        #     # 获取当前基站的最大历史用户速率（需维护历史记录）
+        #     # 注意：此处需在类中初始化并更新self.max_historical_rates
+        #     if not hasattr(self, 'max_historical_rates'):
+        #         self.max_historical_rates = np.zeros((self.num_bs, self.K))
+        #     current_max_rates = self.max_historical_rates[bs_idx]
+        #
+        #     # 获取当前用户速率（假设all_rate_list包含所有基站的所有用户速率）
+        #     current_rates = all_rate_list[bs_idx]  # all_rate_list来自循环中的计算
+        #
+        #     # 计算截断速率（式35）
+        #     truncated_rates = []
+        #     for k in range(self.K):
+        #         R_k = current_rates[k]
+        #         if self.update:
+        #             # R_max = max(current_max_rates[k], R_k)  # 更新历史最大值
+        #             R_max = 0.7 * current_max_rates[k] + (1 - 0.7) * R_k
+        #             print(True)
+        #         else:
+        #             R_max = current_max_rates[k]
+        #
+        #         self.max_historical_rates[bs_idx][k] = R_max  # 保存历史最大值
+        #         truncated = np.log(1 + R_k) / np.log(1 + R_max)
+        #         truncated_rates.append(truncated)
+        #
+        #     all_truncated_rates.extend(truncated_rates)
+
+        for bs_idx in range(self.num_bs):
+            # 初始化历史速率记录（如果尚未初始化）
+            if not hasattr(self, 'historical_rates'):
+                # 使用字典或列表的列表保存每个用户的历史速率
+                self.max_historical_rates = np.zeros((self.num_bs, self.K))
+                self.historical_rates = [[[] for _ in range(self.K)] for _ in range(self.num_bs)]
+
+            current_max_rates = self.max_historical_rates[bs_idx]
+            current_rates = all_rate_list[bs_idx]  # 当前时刻的速率
+
+            truncated_rates = []
+            for k in range(self.K):
+                R_k = current_rates[k]
+
+                # 将当前速率添加到历史记录中
+                self.historical_rates[bs_idx][k].append(R_k)
+
+                if self.update:
+                    # 计算历史速率的均值作为 R_max
+                    historical_mean = np.mean(self.historical_rates[bs_idx][k])
+                    R_max = max(historical_mean, R_k)  # 关键修改点
+                else:
+                    R_max = current_max_rates[k]
+
+                # 更新历史最大值（此处实际是历史均值）
+                self.max_historical_rates[bs_idx][k] = R_max
+
+                # 计算截断速率
+                truncated = np.log(1 + R_k) / np.log(1 + R_max)
+                truncated_rates.append(truncated)
+
+            all_truncated_rates.extend(truncated_rates)
+
+        # 后续 beta_t 计算逻辑不变...
+            # 计算beta_t（式36）
+        indicator_sum = 0
+        K_total = self.num_bs * self.K  # 总用户数
+        for r_hat in all_truncated_rates:
+            if (1 - sigma) <= r_hat <= (1 + sigma):
+                indicator_sum += 1
+        beta_t = 1 - (indicator_sum / K_total)
+        # print("用户实际速率", all_rate_list)
+        # if self.update:
+            # print("用户历史速率最大值", self.max_historical_rates)
+
+        # print("用户截断值", all_truncated_rates)
+
+        # print('average_beta_t', beta_t)
+
+        return [all_sub_agent_obs, global_reward, sub_agent_done, sub_agent_info,
+                np.sum(all_j_agent_obs), np.sum(all_j_agent_reward), all_sub_sum_rate, beta_t]
+
+    def determine_ris_position_via_kde(self, user_positions):
+        # 提取用户的x和y坐标
+        users_xy = user_positions[:, :2]
         centroid = users_xy.mean(axis=0)
-
         return centroid
 
     def calculate_LoS_probability(self, d, elevation_angle):
@@ -105,71 +266,80 @@ class EnvCore(object):
 
     def calculate_LoS_RU(self, zRn, zk, d):
         Plos = (1 + (zRn - self.ave_h) / zk) / 2 * np.exp(-(2 * self.kappa * (self.ave_l + self.ave_w)) * d / math.pi
-                                                        + self.kappa * self.ave_w * self.ave_l)
+                                                          + self.kappa * self.ave_w * self.ave_l)
         return Plos
 
     def calculate_path_loss(self, d, LoS_prob):
-        PL_n = (LoS_prob + (1 - LoS_prob) * self.theta) * self.L0 * (d ** (-self.alpha))
+        alpha = 3
+        theta = 100
+        PL_n = (LoS_prob + (1 - LoS_prob) * theta) * (d ** (-alpha))
         return PL_n
 
-    def calculate_Jammer_RIS(self):
+    def calculate_Jammer_RIS(self, ris_element_positions, jammer_position):
         H_LoS_JR = np.zeros((self.J, self.N), dtype=complex)
         H_NLoS_JR = np.zeros((self.J, self.N), dtype=complex)
         H_CSI_JR = np.zeros((self.J, self.N), dtype=complex)
         for x in range(self.J):
             for n in range(self.N):
-                d = np.linalg.norm(self.Jammer_position - self.RIS_element_positions[n])
-                PL_JR = self.L0 * (d ** (-self.alpha))
-                phi_JR_D = (self.RIS_element_positions[n, 0] - self.Jammer_position[0]) / d
-                phi_JR_A = (self.Jammer_position[0] - self.RIS_element_positions[n, 0]) / d
+                d = np.linalg.norm(jammer_position - ris_element_positions[n])
+                PL_JR = 10 ** (-30 / 10) * (d ** (-3.5))
+                phi_JR_D = (ris_element_positions[n, 0] - jammer_position[0]) / d
+                phi_JR_A = (jammer_position[0] - ris_element_positions[n, 0]) / d
                 aR_n = np.exp(-1j * 2 * math.pi / self.lambda_c * (n - 1) * self.dR * phi_JR_D)
                 aB_x = np.exp(-1j * 2 * math.pi / self.lambda_c * (x - 1) * self.dJ * phi_JR_A)
                 H_LoS_JR[x, n] = np.sqrt(PL_JR) * np.dot(aB_x, aR_n.conj().T)
                 H_NLoS_JR[x, n] = np.sqrt(PL_JR) * ((np.random.randn(1) + 1j * np.random.randn(1))
                                                     / np.sqrt(2) * np.sqrt(self.Sigma2BR))
 
-        H_CSI_JR = (np.random.randn(self.J, self.N) + 1j * np.random.randn(self.J, self.N)) / np.sqrt(2) * np.sqrt(self.Sigma_csi_Jammer)
+        H_CSI_JR = (np.random.randn(self.J, self.N) + 1j * np.random.randn(self.J, self.N)) / np.sqrt(2) * np.sqrt(
+            self.Sigma_csi_Jammer)
         H_JR = (np.sqrt(self.K_BR) / np.sqrt(self.K_BR + 1)) * H_LoS_JR + (1 / np.sqrt(self.K_BR + 1)) * H_NLoS_JR
         return H_JR
 
-    def calculate_channel_matrix(self):
+    def calculate_channel_matrix(self, bs_idx):
         H_LoS_BR = np.zeros((self.M, self.N), dtype=complex)
         H_NLoS_BR = np.zeros((self.M, self.N), dtype=complex)
         H_BR = np.zeros((self.M, self.N), dtype=complex)
         for m in range(self.M):
             for n in range(self.N):
-                d = np.linalg.norm(self.BS_position - self.RIS_element_positions[n])
-                elevation_angle = (self.RIS_element_positions[n, 2] - self.BS_position[2]) / d
+                d = np.linalg.norm(self.BS_positions[bs_idx] - self.RIS_element_positions_list[bs_idx][n])
+                elevation_angle = (self.RIS_element_positions_list[bs_idx][n, 2] - self.BS_positions[bs_idx][2]) / d
                 LoS_prob = self.calculate_LoS_probability(d, elevation_angle)
                 PL = self.calculate_path_loss(d, LoS_prob)
-                phi_BR_D = (self.RIS_element_positions[n, 0] - self.BS_position[0]) / d
-                phi_BR_A = (self.BS_position[0] - self.RIS_element_positions[n, 0]) / d
+                phi_BR_D = (self.RIS_element_positions_list[bs_idx][n, 0] - self.BS_positions[bs_idx][0]) / d
+                phi_BR_A = (self.BS_positions[bs_idx][0] - self.RIS_element_positions_list[bs_idx][n, 0]) / d
                 aR_n = np.exp(-1j * 2 * math.pi / self.lambda_c * (n - 1) * self.dR * phi_BR_D)
                 aB_m = np.exp(-1j * 2 * math.pi / self.lambda_c * (m - 1) * self.dB * phi_BR_A)
                 H_LoS_BR[m, n] = np.sqrt(PL) * np.dot(aB_m, aR_n.conj().T)
-                H_NLoS_BR[m, n] = np.sqrt(PL) *((np.random.randn(1) + 1j * np.random.randn(1)) / np.sqrt(2) * np.sqrt(self.Sigma2BR))
+                H_NLoS_BR[m, n] = np.sqrt(PL) * (
+                            (np.random.randn(1) + 1j * np.random.randn(1)) / np.sqrt(2) * np.sqrt(self.Sigma2BR))
         H_BR = (np.sqrt(self.K_BR) / np.sqrt(self.K_BR + 1)) * H_LoS_BR + (1 / np.sqrt(self.K_BR + 1)) * H_NLoS_BR
         return H_BR
 
-    def calculate_channel_matrix_RU(self):
+    def calculate_channel_matrix_RU(self, bs_idx):
         H_LoS_RU = np.zeros((self.N, self.K), dtype=complex)
         H_NLoS_RU = np.zeros((self.N, self.K), dtype=complex)
         H_CSI_RU = np.zeros((self.N, self.K), dtype=complex)
         H_RU = np.zeros((self.N, self.K), dtype=complex)
         for n in range(self.N):
             for k in range(self.K):
-                d = np.sqrt((self.RIS_element_positions[n, 0] - self.user_positions[k, 0]) ** 2 + (
-                            self.RIS_element_positions[n, 1]
-                            - self.user_positions[k, 1]) ** 2 + (
-                                               self.RIS_element_positions[n, 2] - self.user_positions[k, 2]) ** 2)
-                LoS_prob = self.calculate_LoS_RU(self.RIS_element_positions[n, 2], self.user_positions[k, 2], d)
+                d = np.sqrt(
+                    (self.RIS_element_positions_list[bs_idx][n, 0] - self.user_positions_list[bs_idx][k, 0]) ** 2 +
+                    (self.RIS_element_positions_list[bs_idx][n, 1] - self.user_positions_list[bs_idx][k, 1]) ** 2 +
+                    (self.RIS_element_positions_list[bs_idx][n, 2] - self.user_positions_list[bs_idx][k, 2]) ** 2)
+                LoS_prob = self.calculate_LoS_RU(self.RIS_element_positions_list[bs_idx][n, 2],
+                                                 self.user_positions_list[bs_idx][k, 2], d)
                 PL = self.calculate_path_loss(d, LoS_prob)
-                aR_n = np.exp(-1j * 2 * math.pi / self.lambda_c * (n - 1) * self.dR * (self.RIS_element_positions[n, 0] - self.user_positions[k, 0]) / d)
+                aR_n = np.exp(-1j * 2 * math.pi / self.lambda_c * (n - 1) * self.dR *
+                              (self.RIS_element_positions_list[bs_idx][n, 0] - self.user_positions_list[bs_idx][
+                                  k, 0]) / d)
                 H_LoS_RU[n, k] = np.sqrt(PL) * aR_n
-                H_NLoS_RU[n, k] = np.sqrt(PL) *((np.random.randn(1) + 1j * np.random.randn(1)) / np.sqrt(2) * np.sqrt(self.Sigma2RU))
-        H_CSI_RU = (np.random.randn(self.N, self.K) + 1j * np.random.randn(self.N, self.K)) / np.sqrt(2) * np.sqrt(self.Sigma_csi)
-        H_RU = (1 / np.sqrt(self.K_RU + 1)) * (np.sqrt(self.K_RU) * H_LoS_RU + (1 / np.sqrt(self.K_RU + 1)) * H_NLoS_RU) + H_CSI_RU
-
+                H_NLoS_RU[n, k] = np.sqrt(PL) * (
+                            (np.random.randn(1) + 1j * np.random.randn(1)) / np.sqrt(2) * np.sqrt(self.Sigma2RU))
+        H_CSI_RU = (np.random.randn(self.N, self.K) + 1j * np.random.randn(self.N, self.K)) / np.sqrt(2) * np.sqrt(
+            self.Sigma_csi)
+        H_RU = (1 / np.sqrt(self.K_RU + 1)) * (
+                    np.sqrt(self.K_RU) * H_LoS_RU + (1 / np.sqrt(self.K_RU + 1)) * H_NLoS_RU) + H_CSI_RU
         return H_RU
 
     def PDA_model(self, angles):
@@ -185,91 +355,126 @@ class EnvCore(object):
         Theta = np.diag(PDA)
         return Theta
 
-    def calculate_sinr(self, G, W, user_index, tau, Theta, H_BR, H_RU, H_JR):
+    def calculate_sinr(self, G, W, user_index, tau, Theta, H_BR, H_RU, H_JR, bandwidth):
         sum_power_j = 0
         Tau_Matrix = np.diag(tau)
-        IT_Matrix = np.diag(1-tau)
+        IT_Matrix = np.diag(1 - tau)
         power_t_1 = np.sum(np.abs(np.dot((H_BR @ Tau_Matrix).conj().T, (G)))) * self.P_tx
         power_t_2 = np.sum(np.abs(np.dot((H_JR @ Tau_Matrix).conj().T, (W)))) * self.P_Jammer
         sum_power_t = power_t_1 + power_t_2
+        # print("H_BR NaN check:", np.isnan(H_BR).any())
+        # print("Tau_Matrix NaN check:", np.isnan(Tau_Matrix).any())
+        # print("G NaN check:", np.isnan(G).any())
+        # print("W NaN check:", np.isnan(W).any())
         h_k = H_RU[:, user_index].reshape(1, -1) @ Theta @ IT_Matrix @ H_BR.conj().T @ (G[:, user_index])
         signal_power = np.abs(h_k * self.P_tx) ** 2
 
         for j_r in range(self.J):
             h_j = H_RU[:, j_r].reshape(1, -1) @ Theta @ IT_Matrix @ H_JR.conj().T @ (W[:, j_r])
-            w_norm = np.linalg.norm(W[:, j_r])
             power_j = np.abs(h_j * self.P_Jammer) ** 2
             sum_power_j = sum_power_j + power_j
 
-        interference_power = self.P_tx * sum(np.abs(H_RU[:, j].reshape(1, -1) @ Theta @IT_Matrix @ H_BR.conj().T @ G[:, j]) ** 2 for j in range(self.K) if j != user_index)
+        interference_power = self.P_tx * sum(
+            np.abs(H_RU[:, j].reshape(1, -1) @ Theta @ IT_Matrix @ H_BR.conj().T @ G[:, j]) ** 2
+            for j in range(self.K) if j != user_index)
         sinr_db = 10 * np.log10(signal_power / (sum_power_j + self.sigma_noise))
         sinr_linear = 10 ** (sinr_db / 10)
-        rate = np.log2(1 + sinr_linear)
+        if torch.is_tensor(sinr_linear):
+            # 确保张量在CPU上，然后再转换为numpy
+            sinr_linear = sinr_linear.detach().cpu()  # 使用detach()确保梯度不会传播
+            sinr_linear = sinr_linear.numpy()
+        if torch.is_tensor(bandwidth):
+            # 确保张量在CPU上，然后再转换为numpy
+            bandwidth = bandwidth.detach().cpu()  # 使用detach()确保梯度不会传播
+            bandwidth = bandwidth.numpy()
+        if bandwidth == 0:
+            bandwidth = 0.000001
+        rate = bandwidth * np.log2(1 + sinr_linear)  # 考虑带宽影响
         return sinr_db, sum_power_t, rate, signal_power
 
-    def calculate_reward(self, action_G, action_phase, action_tau, action_W):
+    def calculate_reward(self, action_G, action_phase, action_tau, action_W, bs_idx, bandwidth):
         rate_list = []
         h_k_list = []
-        rate_min = np.log2(1 + 10 ** (self.db_min / 10))
+        if torch.is_tensor(bandwidth):
+            # 确保张量在CPU上，然后再转换为numpy
+            bandwidth = bandwidth.detach().cpu()  # 使用detach()确保梯度不会传播
+            bandwidth = bandwidth.numpy()
+        if bandwidth == 0:
+            bandwidth = 0.000001
+        rate_min = bandwidth * np.log2(1 + 10 ** (self.db_min / 10))
         sum_rate = 0
         sum_rate_for_jammer = 0
         sum_power_t = 0
         reward = 0
-        reward_1 = 0
-        P_in = 0
+        reward_1 = 0  # 有关rate的惩罚，负数
+        reward_2 = 0  # 有关EH的惩罚，负数
         U_sinr = np.zeros(self.K)
-        u_rate_for_jammer = np.zeros(self.K)
         Theta = self.calculate_phase_shift_matrix(action_phase)
-        H_BR = self.calculate_channel_matrix()
-        H_JR = self.calculate_Jammer_RIS()
-        H_RU = self.calculate_channel_matrix_RU()
+        H_BR = self.calculate_channel_matrix(bs_idx)
+        H_JR = self.calculate_Jammer_RIS(self.RIS_element_positions_list[bs_idx], self.Jammer_positions[bs_idx])
+        H_RU = self.calculate_channel_matrix_RU(bs_idx)
+
         for u in range(self.K):
-            U_sinr[u], sum_power_t, u_rate, signal_power = self.calculate_sinr(action_G, action_W, u, action_tau, Theta, H_BR, H_RU, H_JR)
-            rate_list.append(u_rate)
+            U_sinr[u], sum_power_t, u_rate, signal_power = self.calculate_sinr(
+                action_G, action_W, u, action_tau, Theta, H_BR, H_RU, H_JR, bandwidth)
+            rate_list.append(u_rate)  # 存放每个用户的速率
             h_k_list.append(signal_power)
             if u_rate < rate_min:
                 reward_1 = reward_1 + u_rate - rate_min
             sum_rate = sum_rate + u_rate
 
-        rate_array = np.array(rate_list)
-        if np.sum(rate_array) > 0:
-            sum_rates = np.sum(rate_array)
-            sum_squared_rates = np.sum(rate_array ** 2)
-            jains_fairness = (sum_rates ** 2) / (self.K * sum_squared_rates)
-        else:
-            jains_fairness = 0.0
-
-        reward = reward + min(rate_list)
+        reward = reward + min(rate_list)  # 最小速率奖励
         sum_power_in = self.yita * sum_power_t
-        reward_2 = sum_power_in - self.pin_min
+        # print("每个RIS的吸收能量：", sum_power_in)
+        # print("用户速率最大值：", max(rate_list))
         if sum_power_in < self.pin_min:
-            reward = reward + reward_1 / (reward_1 + reward_2) + reward_2 / (reward_1 + reward_2)
-        next_state = self.get_state(sum_power_in, h_k_list)
-        next_state_for_jammer = self.get_state_for_jammer(max(rate_list))
-        return reward, next_state, 1/max(rate_list), next_state_for_jammer, sum_rate, jains_fairness, rate_array, sum_power_in
+            reward_2 = reward_2 + sum_power_in - self.pin_min
+            # print("能量惩罚：", reward_2)
 
+        if sum_power_in < self.pin_min:
+            # print("奖励", reward, "速率惩罚", reward_1, "能量惩罚", reward_2)
+            reward = 0.4 * reward + 0.30 * reward_1 + 0.30 * reward_2
+            # print("最终奖励", reward)
 
-    def get_state(self, sum_power_in, h_k_list):
+        next_state = self.get_state(sum_power_in, h_k_list, bs_idx)
+        next_state_for_jammer = self.get_state_for_jammer(sum(rate_list), bs_idx)
+
+        return reward, next_state, 1 / max(rate_list), next_state_for_jammer, sum_rate, sum_power_in, rate_list
+
+    def get_state(self, sum_power_in, h_k_list, bs_idx):
         state_list = []
-
         state_sum_power_in = np.array(sum_power_in, ndmin=1)
         state_h_k_list = np.array(h_k_list).flatten()
         state_P_in = np.array(self.pin_min, ndmin=1)
 
-        state_list.append(state_sum_power_in)
-        state_list.append(state_h_k_list)
-        state_list.append(state_P_in)
-        state_array = np.concatenate(state_list)
+        # 添加基站位置信息
+        # state_bs_pos = np.array(self.BS_positions[bs_idx][:2], ndmin=1)  # 只取x,y坐标
 
+        # 添加Jammer位置信息
+        # state_jammer_pos = np.array(self.Jammer_positions[bs_idx][:2], ndmin=1)
+
+        state_list.append(state_sum_power_in)
+        # state_list.append(state_h_k_list)
+        state_list.append(state_P_in)
+        # state_list.append(state_bs_pos)
+        # state_list.append(state_jammer_pos)
+
+        state_array = np.concatenate(state_list)
         return state_array
 
-    def get_state_for_jammer(self, sum_rate_for_jammer):
+    def get_state_for_jammer(self, sum_rate_for_jammer, bs_idx):
         state_list_jammer = []
-
         state_sum_rate_for_jammer = np.array(sum_rate_for_jammer, ndmin=1)
 
+        # 添加Jammer对应的BS位置信息
+        state_bs_pos = np.array(self.BS_positions[bs_idx][:2], ndmin=1)
+
+        # 添加Jammer自身位置信息
+        state_jammer_pos = np.array(self.Jammer_positions[bs_idx][:2], ndmin=1)
+
         state_list_jammer.append(state_sum_rate_for_jammer)
+        # state_list_jammer.append(state_bs_pos)
+        # state_list_jammer.append(state_jammer_pos)
 
         state_array_jammer = np.concatenate(state_list_jammer)
-
         return state_array_jammer

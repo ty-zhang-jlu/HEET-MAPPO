@@ -72,12 +72,15 @@ class CriticNetwork(nn.Module):
         return state_action_value
 
     def save_checkpoint(self):
+        print('... saving checkpoint ...')
         T.save(self.state_dict(), self.checkpoint_file)
 
     def load_checkpoint(self):
+        print('... loading checkpoint ...')
         self.load_state_dict(T.load(self.checkpoint_file, map_location='cuda'))
 
     def save_best(self):
+        print('... saving best checkpoint ...')
         checkpoint_file = os.path.join(self.checkpoint_dir, self.name + '_best')
         T.save(self.state_dict(), checkpoint_file)
 
@@ -90,6 +93,7 @@ class ActorNetwork(nn.Module):
         self.fc1_dims = fc1_dims
         self.fc2_dims = fc2_dims
         self.name = name
+        self.activation = nn.LeakyReLU()
         self.checkpoint_dir =  os.path.join(os.path.dirname(os.path.realpath(__file__)), chkpt_dir)
         self.checkpoint_file = os.path.join(self.checkpoint_dir, self.name + '_opt_ddpg')
 
@@ -109,33 +113,41 @@ class ActorNetwork(nn.Module):
         self.fc1.weight.data.uniform_(-f1, f1)
         self.fc1.bias.data.uniform_(-f1, f1)
 
-        f3 = 0.003
+        f3 = 0.001
         self.mu.weight.data.uniform_(-f3, f3)
         self.mu.bias.data.uniform_(-f3, f3)
 
-        self.optimizer = optim.Adam(self.parameters(), lr=alpha)
+        self.optimizer = optim.RMSprop(self.parameters(), lr=alpha)
         self.device = T.device('cuda')
 
         self.to(self.device)
 
     def forward(self, state):
         x = self.fc1(state)
+        print("fc1 output:", x.cpu().detach().numpy())  # 调试输出
         x = self.bn1(x)
+        x = self.activation(x)
         x = F.relu(x)
         x = self.fc2(x)
+        # print("fc2 output:", x.cpu().detach().numpy())  # 调试输出
         x = self.bn2(x)
         x = F.relu(x)
+        x = T.clamp(x, -10, 10)  # 裁剪输入到sigmoid的
         x = T.sigmoid(self.mu(x))
-
+        # print("mu output:", x.cpu().detach().numpy())  # 调试输出
         return x
 
+
     def save_checkpoint(self):
+        print('... saving checkpoint ...')
         T.save(self.state_dict(), self.checkpoint_file)
 
     def load_checkpoint(self):
+        print('... loading checkpoint ...')
         self.load_state_dict(T.load(self.checkpoint_file, map_location='cuda'))
 
     def save_best(self):
+        print('... saving best checkpoint ...')
         checkpoint_file = os.path.join(self.checkpoint_dir, self.name + '_best')
         T.save(self.state_dict(), checkpoint_file)
 
@@ -149,8 +161,8 @@ class ReplayBuffer():
         self.reward_memory = np.zeros(self.mem_size)
         self.new_state_memory = np.zeros((self.mem_size, input_shape), dtype=np.float16)
         self.terminal_memory = np.zeros(self.mem_size, dtype=np.bool)
-        self.priorities = np.zeros(self.mem_size, dtype=np.float32)
-        self.max_priority = 1.0
+        self.priorities = np.zeros(self.mem_size, dtype=np.float32)  # 新增优先级数组
+        self.max_priority = 1.0  # 初始化最大优先级
 
     def store_transition(self, state, action, reward, state_, done):
         index = self.mem_cntr % self.mem_size
@@ -159,7 +171,7 @@ class ReplayBuffer():
         self.reward_memory[index] = reward
         self.new_state_memory[index] = state_
         self.terminal_memory[index] = done
-        self.priorities[index] = self.max_priority
+        self.priorities[index] = self.max_priority  # 新存储的经验初始化为最大优先级
         self.mem_cntr += 1
 
     def sample_buffer(self, batch_size, beta):
@@ -177,15 +189,15 @@ class ReplayBuffer():
         states_ = self.new_state_memory[indices]
         dones = self.terminal_memory[indices]
 
-        return states, actions, rewards, states_, dones, indices
+        return states, actions, rewards, states_, dones, indices  # 返回索引以便更新优先级
 
     def update_priorities(self, indices, priorities):
         for idx, priority in zip(indices, priorities):
             self.priorities[idx] = priority
-            self.max_priority = max(self.max_priority, priority)
+            self.max_priority = max(self.max_priority, priority)  # 更新最大优先级
 
 class OUActionNoise():
-    def __init__(self, mu, sigma=0.15, theta=0.2, dt=1e-2, x0=None):
+    def __init__(self, mu, sigma=0.01, theta=0.2, dt=1e-2, x0=None):
         self.theta = theta
         self.mu = mu
         self.sigma = sigma
@@ -235,9 +247,15 @@ class Agent_J():
         self.actor.eval()
         state = T.tensor([observation], dtype=T.float).to(self.actor.device)
         mu = self.actor.forward(state).to(self.actor.device)
+        # print("mu:", mu.cpu().detach().numpy())  # 打印mu
         mu_prime = mu + T.tensor(self.noise(), dtype=T.float).to(self.actor.device)
+        mu_prime = T.clamp(mu_prime, 0.0, 1.0)
+        # print("mu_prime:", mu_prime.cpu().detach().numpy())  # 打印mu_prime
+        # 检测并替换 NaN 值为 0-1 之间的随机数
+        if T.isnan(mu_prime).any():
+            print("NaN detected in mu_prime, replacing with random values")
+            mu_prime = T.where(T.isnan(mu_prime), T.rand_like(mu_prime), mu_prime)
         self.actor.train()
-
         return mu_prime.cpu().detach().numpy()[0]
 
     def remember(self, state, action, reward, state_, done):
@@ -271,29 +289,38 @@ class Agent_J():
         self.target_critic.eval()
         self.critic.eval()
 
+        # 选择目标动作（使用目标Actor网络）
         target_actions = self.target_actor.forward(states_)
 
+        # 计算目标Q值
         target_Q_values = self.target_critic.forward(states_, target_actions.detach())
         target_Q_values = target_Q_values.squeeze(1).detach()
         expected_Q_values = rewards + (self.gamma * target_Q_values * (1.0 - dones.float()))
 
+        # 计算当前Q值
         current_Q_values = self.critic.forward(states, actions).squeeze(1)
+        print("current_Q_values:", current_Q_values.cpu().detach().numpy())  # 打印Q值
 
+        # 计算损失
         critic_loss = F.mse_loss(current_Q_values, expected_Q_values)
 
+        # 优化Critic网络
         self.critic.optimizer.zero_grad()
         critic_loss.backward()
         self.critic.optimizer.step()
         self.critic.eval()
+        # ... (其他学习代码保持不变，包括Actor网络的更新)
         self.actor.train()
         self.actor.optimizer.zero_grad()
         actor_loss = -self.critic.forward(states, self.actor.forward(states))
         actor_loss = T.mean(actor_loss)
         actor_loss.backward()
+        T.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)  # 梯度裁剪
         self.actor.optimizer.step()
 
+        # 计算TD误差并更新优先级
         td_errors = T.abs(current_Q_values - expected_Q_values).detach().cpu().numpy()
-        self.memory.update_priorities(indices, td_errors + 1e-8)
+        self.memory.update_priorities(indices, td_errors + 1e-8)  # 加1e-8防止0优先级
         self.update_network_parameters(tau=0.005)
 
     def update_network_parameters(self, tau=None):
